@@ -44,6 +44,8 @@ def main() -> int:
     server = CanaryServer(args.host, ports)
     server.start()
 
+    return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())

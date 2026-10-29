@@ -1,166 +1,259 @@
+"""CanaryServer (asyncio variant) – modern concurrency handling.
+
+Instead of one thread per connection, this uses a single asyncio event loop
+and one coroutine per client. This eliminates the classic threading issues:
+
+* no manual thread pool / no future lists anymore
+* no race condition on shutdown (event is created in __init__)
+* real graceful shutdown via signals (SIGTERM, SIGHUP, SIGINT)
+* blocking /proc access runs via asyncio.to_thread outside the loop
+
+The public API remains synchronous; asyncio is encapsulated as an
+implementation detail inside start().
+"""
+
+from __future__ import annotations
+
+import asyncio
+import errno
+import logging
+import os
+import signal
 import socket
 import time
-import signal
-import threading
-import selectors
-import logging
 from datetime import datetime, timezone
-import os
+from typing import Optional
 
-from concurrent.futures import ThreadPoolExecutor, Future
+ENABLE_PEER_PID = True   # can be disabled with --no-peer-pid
 
-ENABLE_PEER_PID = True   # kann per --no-peer-pid abgeschaltet werden
 
 class CanaryServer:
-    def __init__(self, host: str, ports: list[int], config: dict | None = None,
-                 log_file: str | None = None, quiet: bool = False,
-                 workers: int = 128, ipv6: bool = False):
+    def __init__(
+        self,
+        host: str,
+        ports: list[int],
+        config: dict | None = None,
+        log_file: str | None = None,
+        quiet: bool = False,
+        workers: int = 128,          # not used with asyncio (API compatibility)
+        ipv6: bool = False,
+    ):
         self.host = host
-        self.config = config
+        self.ports = ports
+        self.config = config or {}
         self.log_file = log_file
         self.quiet = quiet
-        self.state = {"count": 0, "by_path": {}, "by_client": {}, "lock": threading.Lock()}
-        self.selector = selectors.DefaultSelector()
-        self.socks: list[socket.socket] = []
-        self.failed: list[tuple[int, OSError]] = []
-        # thread heandling
-        self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="canary")
-        self.running = True
-        self._futures: list[Future] = []
+        self.ipv6 = ipv6
 
-        for port in ports:
-            self._bind(host, port, ipv6)
+        self._servers: list[asyncio.AbstractServer] = []
+        self._stop = asyncio.Event()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._count = 0
+        self._by_path: dict = {}
+        self._by_client: dict = {}
+        self._print_lock = asyncio.Lock()   # serializes terminal output
 
-    def _bind(self, host: str, port: int, ipv6: bool) -> None:
-        families = [(socket.AF_INET, socket.SOCK_STREAM, host)]
-        if ipv6:
-            families.append((socket.AF_INET6, socket.SOCK_STREAM, "::"))
-        for family, stype, addr in families:
-            try:
-                s = socket.socket(family, stype)
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                if family == socket.AF_INET6:
-                    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-                s.bind((addr, port))
-                s.listen(128)
-                s.setblocking(False)
-                self.selector.register(s, selectors.EVENT_READ, port)
-                self.socks.append(s)
-            except OSError as exc:
-                self.failed.append((port, exc))
-                try:
-                    s.close()
-                except OSError:
-                    pass
+    # ------------------------------------------------------------------ #
+    # public API
+    # ------------------------------------------------------------------ #
+    def start(self) -> None:
+        """Starts the server and blocks until it is stopped.
 
-    def _on_term(self, signum, frame):
-        self.stop_event.set()
-
-    def start(self):
-        worker = threading.Thread(target=self._serve_forever, daemon=True)
-        worker.start()
-
-        self.stop_event = threading.Event()
-
-        signal.signal(signal.SIGTERM, self._on_term)
-        signal.signal(signal.SIGHUP, self._on_term)
-
+        asyncio is encapsulated internally; the caller does not need to
+        manage the event loop themselves.
+        """
         try:
-            while worker.is_alive() and not self.stop_event.is_set():
-                time.sleep(0.3)
+            asyncio.run(self._run())
         except KeyboardInterrupt:
-            print("\n\033[1;33mBeende…\033[0m")
+            print("\n\033[1;33mShutting down…\033[0m")
+
+    async def _run(self) -> None:
+        loop = asyncio.get_running_loop()
+        self._loop = loop
+
+        # Timestamp of the last EMFILE/ENOBUFS warning, to avoid endless spam
+        _last_resource_warning: float = 0.0
+
+        # Custom exception handler for the event loop, so that
+        # "Too many open files" (EMFILE) is not flooded as an ugly traceback
+        # to the terminal, but logged as a single WARNING.
+        def _loop_exception_handler(loop, context):
+            nonlocal _last_resource_warning
+            exception = context.get("exception")
+            if isinstance(exception, OSError) and exception.errno in (
+                errno.EMFILE,   # Too many open files
+                errno.ENOBUFS,  # No buffer space available
+            ):
+                now = time.monotonic()
+                if now - _last_resource_warning < 5.0:
+                    return
+                _last_resource_warning = now
+                logging.warning(
+                    "System limit reached: too many open files (EMFILE). "
+                    "New connections cannot be accepted temporarily. "
+                    "Increase the limit with: ulimit -n 65536"
+                )
+                return
+            # Fallback: asyncio default handler for all other exceptions
+            loop.default_exception_handler(context)
+
+        loop.set_exception_handler(_loop_exception_handler)
+
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, self._stop.set)
+            except NotImplementedError:
+                # e.g. Windows: add_signal_handler not supported
+                pass
+
+        await self._bind_all()
+
+        print(f"\033[1;32mCanaryServer listening on {self.host}:{self.ports}\033[0m", flush=True)
+
+        try:
+            await self._stop.wait()
         finally:
-            self.stop()
-            print(server.summary())
+            await self.stop()
+            self._print_summary()
 
-    def stop(self) -> None:
-        self.running = False
-        for s in self.socks:
+    async def stop(self) -> None:
+        for srv in self._servers:
+            srv.close()
+        for srv in self._servers:
+            await srv.wait_closed()
+        self._servers.clear()
+
+    # ------------------------------------------------------------------ #
+    # Network
+    # ------------------------------------------------------------------ #
+    async def _bind_all(self) -> None:
+        for port in self.ports:
+            await self._bind_port(port)
+
+    async def _bind_port(self, port: int) -> None:
+        families = [socket.AF_INET]
+        if self.ipv6:
+            families.append(socket.AF_INET6)
+
+        for family in families:
+            bind_host = "::" if family == socket.AF_INET6 else self.host
             try:
-                self.selector.unregister(s)
-            except (KeyError, ValueError, OSError):
-                pass
-            try:
-                s.close()
-            except OSError:
-                pass
-        self.pool.shutdown(wait=False, cancel_futures=True)
+                srv = await asyncio.start_server(
+                    self._client_handler,
+                    host=bind_host,
+                    port=port,
+                    family=family,
+                    reuse_address=True,
+                )
+                self._servers.append(srv)
+                actual = srv.sockets[0].getsockname()[1]
+                logging.info("Listening on %s:%s (AF=%s)", bind_host, actual, family)
+            except OSError as exc:
+                logging.warning("Port %s (AF=%s) not bindable: %s", port, family, exc)
 
-    def _serve_forever(self) -> None:
-        while self.running:
-            try:
-                events = self.selector.select(timeout=0.5)
-            except OSError:
-                continue
-            if not events:
-                print(".", end='', flush=True)
-            for key, _ in events:
-                try:
-                    conn, addr = key.fileobj.accept()
-                except OSError:
-                    continue
-                port = key.data
-                future = self.pool.submit(self._process, conn, addr, port)
-                self._futures.append(future)
-            self._reap_futures()
+    # ------------------------------------------------------------------ #
+    # per connection (coroutine, no thread!)
+    # ------------------------------------------------------------------ #
+    async def _client_handler(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        addr = writer.get_extra_info("peername")
+        peer = f"{addr[0]}:{addr[1]}" if addr else "?"
+        port = writer.get_extra_info("sockname")[1] if addr else 0
+        sock = writer.get_extra_info("socket")
 
-    def _reap_futures(self) -> None:
-        remaining: list[Future] = []
-        for future in self._futures:
-            if future.done():
-                try:
-                    future.result()
-                except Exception as exc:
-                    logging.exception("Wprker exception")
-            else:
-                remaining.append(future)
-        self._futures = remaining
+        proc: Optional[dict] = None
+        if ENABLE_PEER_PID and addr and (
+            addr[0].startswith("127.") or addr[0] == "::1"
+        ):
+            proc = await asyncio.to_thread(self._peer_process, sock, addr)
 
-    def _process(self, conn: socket.socket, addr, port: int) -> None:
-        peer = f"{addr[0]}:{addr[1]}"
-        # Wer sendet? (nur bei Loopback sinnvoll)
         try:
-            local_ip, local_port = conn.getsockname()[:2]
-        except OSError:
-            local_ip, local_port = "127.0.0.1", port
-        proc = self._peer_process(local_ip, local_port, addr[0], addr[1])
-        try:
-            conn.settimeout(5.0)
             try:
-                first = conn.recv(8192)
-            except (socket.timeout, TimeoutError):
-                first = b""
-            except OSError:
+                first = await asyncio.wait_for(reader.read(8192), timeout=5.0)
+            except (asyncio.TimeoutError, TimeoutError):
                 first = b""
 
             if not first:
-                self.record({"proto": "EMPTY", "client": peer, "port": port,
-                             "process": proc,
-                             "note": "Verbindung ohne Daten (geschlossen)"})
+                await self._record(
+                    {
+                        "proto": "EMPTY",
+                        "client": peer,
+                        "port": port,
+                        "process": proc,
+                        "note": "Connection without data (closed)",
+                    }
+                )
                 return
 
-            self._handle(conn, peer, port, first, proc)
-        except Exception as exc:  # nie den Listener killen
-            try:
-                self.record({"proto": "ERROR", "client": peer, "port": port,
-                             "process": proc, "note": repr(exc)})
-            except Exception:
-                pass
+            await self._handle(reader, writer, peer, port, first, proc)
+
+        except asyncio.CancelledError:
+            raise
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            # Client terminated the connection early – normal operation
+            pass
+        except OSError as exc:
+            if exc.errno in (errno.EMFILE, errno.ENOBUFS):
+                logging.warning(
+                    "Resource limit reached for client %s: %s", peer, exc.strerror
+                )
+            else:
+                logging.exception("Client handler error for %s: %s", peer, exc)
+        except Exception as exc:  # never kill the event loop
+            logging.exception("Client handler error for %s: %s", peer, exc)
         finally:
             try:
-                conn.shutdown(socket.SHUT_RDWR)
+                writer.close()
+                await writer.wait_closed()
             except OSError:
                 pass
-            conn.close()
 
-    def _peer_process(self, local_ip: str, local_port: int,
-                     peer_ip: str, peer_port: int) -> dict | None:
-        """Ermittelt den lokalen Prozess hinter einer Loopback-Verbindung.
+    async def _handle(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        peer: str,
+        port: int,
+        first: bytes,
+        proc: Optional[dict] = None,
+    ) -> None:
+        payload = first
+        try:
+            extra = await asyncio.wait_for(reader.read(4096), timeout=1.5)
+            if extra:
+                payload += extra
+        except (asyncio.TimeoutError, TimeoutError):
+            pass
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            # Client closed the connection while reading – normal
+            pass
 
-        Nur moeglich, wenn die Verbindung noch steht - bei localhost klappt das
-        praktisch immer, weil der Absender auf die Antwort wartet.
-        """
+        entry = {
+            "proto": "RAW",
+            "client": peer,
+            "port": port,
+            "process": proc,
+            "bytes": len(payload),
+            "payload_text": self._printable(payload)[:2000],
+            "payload_hex": payload[:256].hex(" "),
+            "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds"),
+        }
+        await self._print(entry)
+
+    # ------------------------------------------------------------------ #
+    # peer PID (blocking -> separate thread via to_thread)
+    # ------------------------------------------------------------------ #
+    def _peer_process(self, sock: socket.socket, addr) -> Optional[dict]:
+        """Determines the local process behind a loopback connection (blocking)."""
+        try:
+            local_ip, local_port = sock.getsockname()[:2]
+        except OSError:
+            local_ip, local_port = "127.0.0.1", 0
+        peer_ip, peer_port = addr[0], addr[1]
+        return self._peer_process_from(local_ip, local_port, peer_ip, peer_port)
+
+    def _peer_process_from(self, local_ip, local_port, peer_ip, peer_port):
         if not ENABLE_PEER_PID:
             return None
         if not (peer_ip.startswith("127.") or peer_ip == "::1"):
@@ -174,7 +267,9 @@ class CanaryServer:
         cmd = ""
         try:
             with open(f"/proc/{pid}/cmdline", "rb") as fh:
-                cmd = fh.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+                cmd = (
+                    fh.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+                )
         except OSError:
             pass
         if not cmd:
@@ -186,25 +281,13 @@ class CanaryServer:
         return {"pid": pid, "cmd": cmd[:200]}
 
     def _proc_addr(self, ip: str, port: int) -> str:
-        """Formatiert eine Adresse so, wie sie in /proc/net/tcp steht.
-
-        Achtung: /proc/net/tcp zeigt die IP in Little-Endian-Byte-Reihenfolge,
-        also 127.0.0.1 -> 0100007F (und Grossbuchstaben).
-        """
         try:
             raw = socket.inet_aton(ip)[::-1].hex().upper()
         except (OSError, ValueError):
             return ""
         return f"{raw}:{port:04X}"
 
-
-    def _socket_inode(self, local_ip: str, local_port: int,
-                      peer_ip: str, peer_port: int) -> str | None:
-        """Inode des Sockets der GEGENSEITE, aus /proc/net/tcp (nur IPv4).
-
-        Wichtig: Gesucht ist der Eintrag, bei dem die Gegenstelle der Client ist,
-        also local=Client-Port und remote=mein Port - nicht die eigene Seite.
-        """
+    def _socket_inode(self, local_ip, local_port, peer_ip, peer_port):
         my_hex = self._proc_addr(local_ip, local_port)
         peer_hex = self._proc_addr(peer_ip, peer_port)
         if not my_hex or not peer_hex:
@@ -214,7 +297,7 @@ class CanaryServer:
                 next(fh)
                 for line in fh:
                     p = line.split()
-                    if len(p) < 10 or p[3] != "01":   # 01 = ESTABLISHED
+                    if len(p) < 10 or p[3] != "01":  # 01 = ESTABLISHED
                         continue
                     # p[1] = local, p[2] = remote
                     if p[1] == peer_hex and p[2] == my_hex:
@@ -223,9 +306,7 @@ class CanaryServer:
             pass
         return None
 
-
-    def _pid_for_inode(self, inode: str) -> int | None:
-        """Sucht den Prozess, der den Socket mit dieser Inode-Nummer haelt."""
+    def _pid_for_inode(self, inode: str) -> Optional[int]:
         target = f"socket:[{inode}]"
         try:
             pids = [p for p in os.listdir("/proc") if p.isdigit()]
@@ -245,45 +326,37 @@ class CanaryServer:
                     continue
         return None
 
-    def _handle(self, conn: socket.socket, peer: str, port: int, first: bytes,
-                    proc: dict | None = None) -> None:
-        payload = first
-        try:
-            conn.settimeout(1.5)
-            extra = conn.recv(4096)
-            if extra:
-                payload += extra
-        except (socket.timeout, TimeoutError, OSError):
-            pass
+    # ------------------------------------------------------------------ #
+    # Output
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _printable(payload: bytes) -> str:
+        return "".join(
+            chr(b) if 32 <= b < 127 or b in (9, 10, 13) else "." for b in payload
+        )
 
-        printable = "".join(chr(b) if 32 <= b < 127 or b in (9, 10, 13) else "."
-                            for b in payload)
-        entry = {
-            "proto": "RAW",
-            "client": peer,
-            "port": port,
-            "process": proc,
-            "bytes": len(payload),
-            "payload_text": printable[:2000],
-            "payload_hex": payload[:256].hex(" "),
-            "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds")
-        }
-        self._print(entry)
+    async def _record(self, entry: dict) -> None:
+        async with self._print_lock:
+            self._count += 1
+            await self._print(entry)
 
-    def _print(self, entry: dict) -> None:
+    async def _print(self, entry: dict) -> None:
         proto = entry.get("proto")
         client = entry.get("client", "-")
         port = entry.get("port", "?")
         proc = entry.get("process")
-        who = ""
-        head = f"\n{entry.get("ts")}"
+        head = f"\n{entry.get('ts')}"
         if proto == "HTTP":
-            head += (f"\n\033[1;33m▶ {entry.get('method','?')} {entry.get('path','?')}"
-                    f"\033[0m \033[2mHTTP/{entry.get('version','?')} von {client} "
-                    f"[Port {port}]\033[0m")
+            head += (
+                f"\n\033[1;33m▶ {entry.get('method','?')} {entry.get('path','?')}"
+                f"\033[0m \033[2mHTTP/{entry.get('version','?')} von {client} "
+                f"[Port {port}]\033[0m"
+            )
         elif proto == "RAW":
-            head += (f"\n\033[1;35m◆ RAW {entry.get('bytes',0)} Bytes\033[0m "
-                    f"\033[2mvon {client} [Port {port}]\033[0m")
+            head += (
+                f"\n\033[1;35m◆ RAW {entry.get('bytes',0)} Bytes\033[0m "
+                f"\033[2mvon {client} [Port {port}]\033[0m"
+            )
         else:
             head += f"\n\033[2m· {proto} von {client} [Port {port}]\033[0m"
         if proc:
@@ -305,3 +378,5 @@ class CanaryServer:
             lines.append("    " + entry["payload_text"].replace("\n", "\n    "))
         print("\n".join(lines), flush=True)
 
+    def _print_summary(self) -> None:
+        print(f"\n\033[1;36mTotal {self._count} connections processed.\033[0m", flush=True)

@@ -1,7 +1,12 @@
 import logging
+import resource
 
 MIN_PORT = 1
 MAX_PORT = 65535
+
+# Puffer für FDs, die der Python-Interpreter selbst benötigt
+# (stdin/stdout/stderr, Event-Loop, interne Sockets, etc.)
+_FD_BUFFER = 100
 
 def get_ephemeral_port_range() -> (int, int):
     with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
@@ -43,6 +48,22 @@ def get_ports(arg_ports: str, include_ephemeral: bool) -> list[int]:
                   f"To use these ports: --include-ephemeral")
     if not ports:
         raise ValueError(f"arg_ports: {arg_ports}, the resulting port list is empty")
+
+    # Warnung, wenn die Anzahl der Ports wahrscheinlich das FD-Limit überschreitet
+    try:
+        soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        needed = len(ports) + _FD_BUFFER
+        if needed > soft_limit:
+            logging.warning(
+                f"Estimated {needed} file descriptors needed for {len(ports)} ports "
+                f"+ {_FD_BUFFER} buffer, but ulimit -n (soft limit) is {soft_limit}, "
+                f"hard limit is {hard_limit}. "
+                f"Consider raising it with: ulimit -n {min(needed + 100, hard_limit)}"
+            )
+    except (ImportError, OSError, AttributeError):
+        # resource-Modul nicht verfügbar (z. B. Windows) oder Limit nicht lesbar
+        pass
+
     return sorted(set(ports))
 
 
