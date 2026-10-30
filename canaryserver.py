@@ -17,14 +17,13 @@ from __future__ import annotations
 import asyncio
 import errno
 import logging
-import os
 import signal
 import socket
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
-ENABLE_PEER_PID = True   # can be disabled with --no-peer-pid
+from canarypid import ENABLE_PEER_PID, peer_process
 
 
 class CanaryServer:
@@ -166,7 +165,7 @@ class CanaryServer:
         if ENABLE_PEER_PID and addr and (
             addr[0].startswith("127.") or addr[0] == "::1"
         ):
-            proc = await asyncio.to_thread(self._peer_process, sock, addr)
+            proc = await asyncio.to_thread(peer_process, sock, addr)
 
         try:
             try:
@@ -240,91 +239,6 @@ class CanaryServer:
             "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds"),
         }
         await self._print(entry)
-
-    # ------------------------------------------------------------------ #
-    # peer PID (blocking -> separate thread via to_thread)
-    # ------------------------------------------------------------------ #
-    def _peer_process(self, sock: socket.socket, addr) -> Optional[dict]:
-        """Determines the local process behind a loopback connection (blocking)."""
-        try:
-            local_ip, local_port = sock.getsockname()[:2]
-        except OSError:
-            local_ip, local_port = "127.0.0.1", 0
-        peer_ip, peer_port = addr[0], addr[1]
-        return self._peer_process_from(local_ip, local_port, peer_ip, peer_port)
-
-    def _peer_process_from(self, local_ip, local_port, peer_ip, peer_port):
-        if not ENABLE_PEER_PID:
-            return None
-        if not (peer_ip.startswith("127.") or peer_ip == "::1"):
-            return None
-        inode = self._socket_inode(local_ip, local_port, peer_ip, peer_port)
-        if not inode:
-            return None
-        pid = self._pid_for_inode(inode)
-        if pid is None:
-            return None
-        cmd = ""
-        try:
-            with open(f"/proc/{pid}/cmdline", "rb") as fh:
-                cmd = (
-                    fh.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
-                )
-        except OSError:
-            pass
-        if not cmd:
-            try:
-                with open(f"/proc/{pid}/comm") as fh:
-                    cmd = fh.read().strip()
-            except OSError:
-                cmd = "?"
-        return {"pid": pid, "cmd": cmd[:200]}
-
-    def _proc_addr(self, ip: str, port: int) -> str:
-        try:
-            raw = socket.inet_aton(ip)[::-1].hex().upper()
-        except (OSError, ValueError):
-            return ""
-        return f"{raw}:{port:04X}"
-
-    def _socket_inode(self, local_ip, local_port, peer_ip, peer_port):
-        my_hex = self._proc_addr(local_ip, local_port)
-        peer_hex = self._proc_addr(peer_ip, peer_port)
-        if not my_hex or not peer_hex:
-            return None
-        try:
-            with open("/proc/net/tcp") as fh:
-                next(fh)
-                for line in fh:
-                    p = line.split()
-                    if len(p) < 10 or p[3] != "01":  # 01 = ESTABLISHED
-                        continue
-                    # p[1] = local, p[2] = remote
-                    if p[1] == peer_hex and p[2] == my_hex:
-                        return p[9]
-        except (OSError, ValueError, IndexError):
-            pass
-        return None
-
-    def _pid_for_inode(self, inode: str) -> Optional[int]:
-        target = f"socket:[{inode}]"
-        try:
-            pids = [p for p in os.listdir("/proc") if p.isdigit()]
-        except OSError:
-            return None
-        for pid in pids:
-            fddir = f"/proc/{pid}/fd"
-            try:
-                fds = os.listdir(fddir)
-            except OSError:
-                continue
-            for fd in fds:
-                try:
-                    if os.readlink(f"{fddir}/{fd}") == target:
-                        return int(pid)
-                except OSError:
-                    continue
-        return None
 
     # ------------------------------------------------------------------ #
     # Output
