@@ -41,7 +41,16 @@ def main() -> int:
     args = getArguments()
     ports = get_ports(args.port, args.include_ephemeral)
 
-    server = CanaryServer(args.host, ports)
+    server = CanaryServer(
+        host=args.host,
+        ports=ports,
+        config=args.config,
+        log_file=args.log_file,
+        quiet=args.quiet,
+        workers=args.workers,
+        ipv6=args.ipv6,
+        enable_peer_pid=not args.no_peer_pid,
+    )
     server.start()
 
     return 0

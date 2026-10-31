@@ -1,0 +1,12 @@
+[project]
+name = "port-canary"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "asyncio: mark test as async",
+]
+pythonpath = ["."]
