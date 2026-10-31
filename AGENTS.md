@@ -32,3 +32,7 @@ port-canary is a Python server that listens for TCP connections and prints the r
 - No manual `selectors.DefaultSelector` management (asyncio handles this)
 - No German comments or strings in the code
 - No `asyncio.run()` outside of `CanaryServer.start()`
+
+## Version Control & Commits
+- **Never commit without explicit permission.** Before every `git commit` (all projects, always), show the commit message and the files to be included and ask whether it is OK. Only commit after explicit approval.
+- Commit messages in **English**.
